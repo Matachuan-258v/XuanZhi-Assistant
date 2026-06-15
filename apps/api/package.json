@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "tsx watch --env-file=../../.env src/main.ts",
+    "dev": "tsx watch --env-file=.env src/main.ts",
     "build": "tsc -p tsconfig.json",
     "test": "vitest run",
     "start": "node --env-file=.env dist/main.js"
