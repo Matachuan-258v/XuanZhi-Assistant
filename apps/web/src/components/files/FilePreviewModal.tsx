@@ -33,6 +33,10 @@ function renderTextPreview(content: FileAssetContent & { kind: 'text' }) {
   return <pre>{content.text}</pre>;
 }
 
+function isPdfFile(file: FileAsset) {
+  return file.extension.toLowerCase() === 'pdf' || file.mimeType === 'application/pdf';
+}
+
 function initialPosition(windowIndex = 0) {
   if (typeof window === 'undefined') return { x: 120, y: 72 };
   const offset = (windowIndex % 6) * 32;
@@ -61,7 +65,10 @@ function escapeHtml(value: string) {
 
 function popupDocument(file: FileAsset, content: FileAssetContent | undefined, message = '正在加载预览...') {
   const title = escapeHtml(file.name);
-  const body = content?.kind === 'text'
+  const pdfUrl = fileApi.getFileInlineUrl(file.id);
+  const body = isPdfFile(file)
+    ? `<iframe title="${title}" src="${escapeHtml(pdfUrl)}" referrerpolicy="no-referrer"></iframe>`
+    : content?.kind === 'text'
     ? `<pre>${escapeHtml(content.text)}</pre>`
     : content?.kind === 'image'
       ? `<div class="image-wrap"><img alt="${title}" src="${escapeHtml(content.dataUrl)}" /></div>`
@@ -107,6 +114,13 @@ function popupDocument(file: FileAsset, content: FileAssetContent | undefined, m
       height: calc(100vh - 52px);
       overflow: auto;
       padding: 32px;
+    }
+    iframe {
+      display: block;
+      width: 100%;
+      height: calc(100vh - 116px);
+      border: 0;
+      background: #f4f4f5;
     }
     pre {
       margin: 0;
@@ -171,6 +185,15 @@ export function FilePreviewModal({
     setLoading(true);
     setPosition(initialPosition(windowIndex));
     setSize(initialSize());
+
+    if (isPdfFile(file)) {
+      setContent(undefined);
+      setLoading(false);
+      return () => {
+        cancelled = true;
+      };
+    }
+
     fileApi.getFileContent(file.id)
       .then((nextContent) => {
         if (!cancelled) setContent(nextContent);
@@ -251,6 +274,20 @@ export function FilePreviewModal({
   };
 
   const openDetachedWindow = () => {
+    if (isPdfFile(file)) {
+      const popup = window.open(
+        fileApi.getFileInlineUrl(file.id),
+        `xuanzhi-preview-${file.id}`,
+        'popup=yes,width=980,height=720,left=96,top=72,resizable=yes,scrollbars=yes,noopener,noreferrer',
+      );
+      if (!popup) {
+        toast.error('浏览器拦截了独立预览窗口，请允许弹窗后重试');
+        return;
+      }
+      popup.focus();
+      return;
+    }
+
     const popup = window.open(
       '',
       `xuanzhi-preview-${file.id}`,
@@ -465,6 +502,13 @@ export function FilePreviewModal({
           <section className="file-preview-window-body">
             {loading ? (
               <Empty description="正在加载预览" />
+            ) : isPdfFile(file) ? (
+              <iframe
+                className="file-preview-pdf"
+                referrerPolicy="no-referrer"
+                src={fileApi.getFileInlineUrl(file.id)}
+                title={file.title || file.name}
+              />
             ) : content?.kind === 'text' ? (
               <div className={`file-preview-content is-${file.extension}`}>{renderTextPreview(content)}</div>
             ) : content?.kind === 'image' ? (

@@ -1,10 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import type { FastifyInstance } from 'fastify';
-import type { AgentEvent, LoginResponse, Message, Task, TaskIntent, XuanzhiAgentProfile } from '@xuanzhi/shared/protocol';
+import type {
+  AgentEvent,
+  FileAsset,
+  LoginResponse,
+  Message,
+  Task,
+  TaskIntent,
+  XuanzhiAgentProfile,
+} from '@xuanzhi/shared/protocol';
 
 const gateway = vi.hoisted(() => {
   type Handler = (payload: unknown) => void;
@@ -112,7 +120,42 @@ const gateway = vi.hoisted(() => {
         if (!sessions.some((session) => session.key === input.sessionKey)) {
           throw new Error(`unknown session: ${input.sessionKey}`);
         }
-        setTimeout(() => {
+        const responseDelayMs = input.message.includes('Slow workspace run') ? 80 : 0;
+        setTimeout(async () => {
+          const [{ mkdirSync, writeFileSync }, { join }] = await Promise.all([
+            import('node:fs'),
+            import('node:path'),
+          ]);
+          const gatewayAgentId = input.sessionKey.split(':')[1];
+          const workspace = agents.find((agent) => agent.id === gatewayAgentId)?.workspace;
+          if (workspace && input.message.includes('Create filtered workspace files')) {
+            mkdirSync(join(workspace, 'outputs'), { recursive: true });
+            writeFileSync(join(workspace, 'outputs', 'report.pdf'), '%PDF-1.7 filtered report', 'utf8');
+            writeFileSync(join(workspace, 'outputs', 'private.pem'), 'PRIVATE KEY', 'utf8');
+            writeFileSync(join(workspace, 'SOUL.md'), '# system profile', 'utf8');
+          }
+          if (workspace && input.message.includes('Create duplicate reports')) {
+            mkdirSync(join(workspace, 'first'), { recursive: true });
+            mkdirSync(join(workspace, 'second'), { recursive: true });
+            writeFileSync(join(workspace, 'first', 'report.txt'), 'first report', 'utf8');
+            writeFileSync(join(workspace, 'second', 'report.txt'), 'second report', 'utf8');
+          }
+          if (workspace && input.message.includes('Create report v1')) {
+            mkdirSync(join(workspace, 'outputs'), { recursive: true });
+            writeFileSync(join(workspace, 'outputs', 'report.txt'), 'version one', 'utf8');
+          }
+          if (workspace && input.message.includes('Create report v2')) {
+            mkdirSync(join(workspace, 'outputs'), { recursive: true });
+            writeFileSync(join(workspace, 'outputs', 'report.txt'), 'version two', 'utf8');
+          }
+          if (workspace && input.message.includes('Slow workspace run')) {
+            mkdirSync(join(workspace, 'outputs'), { recursive: true });
+            writeFileSync(join(workspace, 'outputs', 'slow.txt'), 'slow result', 'utf8');
+          }
+          if (workspace && input.message.includes('Fast workspace run')) {
+            mkdirSync(join(workspace, 'outputs'), { recursive: true });
+            writeFileSync(join(workspace, 'outputs', 'fast.txt'), 'fast result', 'utf8');
+          }
           if (input.message.includes('Disk failed tool')) {
             void (async () => {
               const [{ existsSync, mkdirSync, readFileSync, writeFileSync }, { join }] = await Promise.all([
@@ -1670,6 +1713,214 @@ describe('xuanzhi api with OpenClaw Gateway', () => {
 
     expect(downloadResponse.statusCode).toBe(200);
     expect(downloadResponse.body).toContain('# Report');
+  });
+
+  it('only serves PDF file assets inline', async () => {
+    const userA = await login(app, 'alice');
+    const htmlUpload = await app.inject({
+      method: 'POST',
+      url: '/api/files/upload',
+      headers: { authorization: `Bearer ${userA.token}` },
+      payload: {
+        name: 'page.html',
+        content: '<script>alert(1)</script>',
+        mimeType: 'text/html',
+      },
+    });
+    const pdfUpload = await app.inject({
+      method: 'POST',
+      url: '/api/files/upload',
+      headers: { authorization: `Bearer ${userA.token}` },
+      payload: {
+        name: 'report.pdf',
+        content: '%PDF-1.7',
+        mimeType: 'application/pdf',
+      },
+    });
+    const html = htmlUpload.json<FileAsset>();
+    const pdf = pdfUpload.json<FileAsset>();
+
+    const [htmlDownload, pdfDownload] = await Promise.all([
+      app.inject({
+        method: 'GET',
+        url: `/api/files/${html.id}/download?inline=1`,
+        headers: { authorization: `Bearer ${userA.token}` },
+      }),
+      app.inject({
+        method: 'GET',
+        url: `/api/files/${pdf.id}/download?inline=1`,
+        headers: { authorization: `Bearer ${userA.token}` },
+      }),
+    ]);
+
+    expect(htmlDownload.headers['content-disposition']).toContain('attachment');
+    expect(pdfDownload.headers['content-disposition']).toContain('inline');
+  });
+
+  it('does not import mentioned files outside the agent workspace', async () => {
+    const userA = await login(app, 'alice');
+    const task = await createTask(app, userA.token, 'Mention an unsafe file');
+    writeFileSync(join(workspaceRoot, 'outside-secret.txt'), 'outside secret', 'utf8');
+
+    await sendUserMessage(app, userA.token, task.id, 'Mention foo/../../outside-secret.txt');
+
+    await waitForCondition(async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: `/api/tasks/${task.id}`,
+        headers: { authorization: `Bearer ${userA.token}` },
+      });
+      expect(response.json<Task>().status).toBe('completed');
+    });
+    const filesResponse = await app.inject({
+      method: 'GET',
+      url: `/api/tasks/${task.id}/file-assets`,
+      headers: { authorization: `Bearer ${userA.token}` },
+    });
+
+    expect(filesResponse.json<FileAsset[]>()).toEqual([]);
+  });
+
+  it('does not import workspace symlinks that point outside the workspace', async () => {
+    const userA = await login(app, 'alice');
+    const task = await createTask(app, userA.token, 'Mention a linked file');
+    const workspace = userA.agent!.workspace;
+    const outsidePath = join(workspaceRoot, 'linked-secret.txt');
+    mkdirSync(workspace, { recursive: true });
+    writeFileSync(outsidePath, 'linked outside secret', 'utf8');
+    symlinkSync(outsidePath, join(workspace, 'outside-link.txt'));
+
+    await sendUserMessage(app, userA.token, task.id, 'outside-link.txt');
+
+    await waitForCondition(async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: `/api/tasks/${task.id}`,
+        headers: { authorization: `Bearer ${userA.token}` },
+      });
+      expect(response.json<Task>().status).toBe('completed');
+    });
+    const filesResponse = await app.inject({
+      method: 'GET',
+      url: `/api/tasks/${task.id}/file-assets`,
+      headers: { authorization: `Bearer ${userA.token}` },
+    });
+
+    expect(filesResponse.json<FileAsset[]>()).toEqual([]);
+  });
+
+  it('imports only allowed generated files and skips OpenClaw profile files', async () => {
+    const userA = await login(app, 'alice');
+    const task = await createTask(app, userA.token, 'Create filtered workspace files');
+
+    await sendUserMessage(app, userA.token, task.id, 'Create filtered workspace files');
+
+    await waitForCondition(async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: `/api/tasks/${task.id}/file-assets`,
+        headers: { authorization: `Bearer ${userA.token}` },
+      });
+      expect(response.json<FileAsset[]>()).toHaveLength(1);
+    });
+    const filesResponse = await app.inject({
+      method: 'GET',
+      url: `/api/tasks/${task.id}/file-assets`,
+      headers: { authorization: `Bearer ${userA.token}` },
+    });
+
+    expect(filesResponse.json<FileAsset[]>()).toEqual([
+      expect.objectContaining({
+        title: 'report.pdf',
+        source: 'workspace_imported',
+      }),
+    ]);
+  });
+
+  it('keeps generated files with the same basename from different paths', async () => {
+    const userA = await login(app, 'alice');
+    const task = await createTask(app, userA.token, 'Create duplicate reports');
+
+    await sendUserMessage(app, userA.token, task.id, 'Create duplicate reports');
+
+    await waitForCondition(async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: `/api/tasks/${task.id}/file-assets`,
+        headers: { authorization: `Bearer ${userA.token}` },
+      });
+      expect(response.json<FileAsset[]>()).toHaveLength(2);
+    });
+    const filesResponse = await app.inject({
+      method: 'GET',
+      url: `/api/tasks/${task.id}/file-assets`,
+      headers: { authorization: `Bearer ${userA.token}` },
+    });
+
+    expect(filesResponse.json<FileAsset[]>().map((file) => file.summary).sort()).toEqual([
+      'OpenClaw workspace 文件: first/report.txt',
+      'OpenClaw workspace 文件: second/report.txt',
+    ]);
+  });
+
+  it('creates a new version when a generated workspace path changes', async () => {
+    const userA = await login(app, 'alice');
+    const task = await createTask(app, userA.token, 'Create report versions');
+
+    await sendUserMessage(app, userA.token, task.id, 'Create report v1');
+    let firstFile: FileAsset | undefined;
+    await waitForCondition(async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: `/api/tasks/${task.id}/file-assets`,
+        headers: { authorization: `Bearer ${userA.token}` },
+      });
+      firstFile = response.json<FileAsset[]>()[0];
+      expect(firstFile?.version).toBe(1);
+    });
+
+    await sendUserMessage(app, userA.token, task.id, 'Create report v2');
+
+    await waitForCondition(async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: `/api/files/${firstFile!.id}/versions`,
+        headers: { authorization: `Bearer ${userA.token}` },
+      });
+      expect(response.json<FileAsset[]>().map((file) => file.version)).toEqual([2, 1]);
+    });
+  });
+
+  it('serializes OpenClaw runs that share an agent workspace', async () => {
+    const userA = await login(app, 'alice');
+    const slowTask = await createTask(app, userA.token, 'Slow workspace run');
+    const fastTask = await createTask(app, userA.token, 'Fast workspace run');
+
+    await sendUserMessage(app, userA.token, slowTask.id, 'Slow workspace run');
+    await sendUserMessage(app, userA.token, fastTask.id, 'Fast workspace run');
+
+    await waitForCondition(() => {
+      expect(gateway.calls.filter((call) => call.method === 'chat.send')).toHaveLength(1);
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(gateway.calls.filter((call) => call.method === 'chat.send')).toHaveLength(1);
+
+    await waitForCondition(async () => {
+      const [slowResponse, fastResponse] = await Promise.all([
+        app.inject({
+          method: 'GET',
+          url: `/api/tasks/${slowTask.id}/file-assets`,
+          headers: { authorization: `Bearer ${userA.token}` },
+        }),
+        app.inject({
+          method: 'GET',
+          url: `/api/tasks/${fastTask.id}/file-assets`,
+          headers: { authorization: `Bearer ${userA.token}` },
+        }),
+      ]);
+      expect(slowResponse.json<FileAsset[]>().map((file) => file.title)).toEqual(['slow.txt']);
+      expect(fastResponse.json<FileAsset[]>().map((file) => file.title)).toEqual(['fast.txt']);
+    });
   });
 
   it('stores context file ids and sends file context through the OpenClaw session', async () => {

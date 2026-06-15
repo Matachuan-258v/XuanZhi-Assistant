@@ -1,7 +1,11 @@
+import { readFile, readdir, realpath, stat } from 'node:fs/promises';
+import { basename, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+
 import type { Agent, AgentEventStatus, MessagePlanStep, MessageStatus, Task } from '@xuanzhi/shared/protocol';
 
 import type { MemoryStore } from '../repositories/memoryStore.js';
 import type { StreamHub } from '../realtime/streamHub.js';
+import type { FileAssetService } from '../services/fileAssetService.js';
 import { toolCallToPlanStep } from '../services/sessionService.js';
 import type { SessionService } from '../services/sessionService.js';
 import { getOpenClawClient } from './openclawClient.js';
@@ -49,6 +53,33 @@ type AgentHandle = {
 };
 
 const ASSISTANT_RESPONSE_TIMEOUT = 120_000;
+const GENERATED_FILE_SCAN_LIMIT = 20;
+const GENERATED_FILE_MAX_BYTES = 25 * 1024 * 1024;
+const GENERATED_FILE_MTIME_SKEW_MS = 5_000;
+const GENERATED_FILE_SKIP_DIRS = new Set(['.git', '.openclaw', '.xuanzhi', 'node_modules']);
+const GENERATED_FILE_SKIP_NAMES = new Set([
+  'AGENTS.md',
+  'HEARTBEAT.md',
+  'IDENTITY.md',
+  'README.md',
+  'SOUL.md',
+  'USER.md',
+  'xuanzhi-profile.json',
+]);
+const GENERATED_FILE_EXTENSIONS = new Set([
+  'csv', 'diff', 'doc', 'docx', 'gif', 'html', 'jpeg', 'jpg', 'json', 'jsonl',
+  'md', 'pdf', 'png', 'ppt', 'pptx', 'py', 'sql', 'svg', 'ts', 'tsx', 'txt',
+  'webp', 'xls', 'xlsx', 'zip',
+]);
+
+type WorkspaceFileCandidate = {
+  absolutePath: string;
+  relativePath: string;
+  sizeBytes: number;
+  mtimeMs: number;
+};
+
+type WorkspaceFileSnapshot = Map<string, { sizeBytes: number; mtimeMs: number }>;
 
 function eventSessionKey(payload: { sessionKey?: string; session_key?: string; key?: string }) {
   return payload.sessionKey ?? payload.session_key ?? payload.key;
@@ -165,6 +196,231 @@ function extractChatText(payload: ChatEventPayload): string | null {
 
 function getAgentDisplayName(agent: AgentHandle) {
   return agent.profile?.agentName?.trim() || agent.name.trim() || agent.id;
+}
+
+function isImportableWorkspaceFile(relativePath: string) {
+  const fileName = basename(relativePath);
+  const extension = extname(fileName).slice(1).toLowerCase();
+  return !GENERATED_FILE_SKIP_NAMES.has(fileName) && GENERATED_FILE_EXTENSIONS.has(extension);
+}
+
+async function resolveWorkspaceFile(workspace: string, mentionedPath: string) {
+  const workspaceRoot = resolve(workspace);
+  const absolutePath = resolve(workspaceRoot, mentionedPath);
+  const relativePath = relative(workspaceRoot, absolutePath);
+  if (
+    !relativePath
+    || relativePath === '..'
+    || relativePath.startsWith(`..${sep}`)
+    || isAbsolute(relativePath)
+  ) {
+    return undefined;
+  }
+  try {
+    const [realWorkspaceRoot, realAbsolutePath] = await Promise.all([
+      realpath(workspaceRoot),
+      realpath(absolutePath),
+    ]);
+    const realRelativePath = relative(realWorkspaceRoot, realAbsolutePath);
+    if (
+      !realRelativePath
+      || realRelativePath === '..'
+      || realRelativePath.startsWith(`..${sep}`)
+      || isAbsolute(realRelativePath)
+    ) {
+      return undefined;
+    }
+    return { absolutePath: realAbsolutePath, relativePath };
+  } catch {
+    return undefined;
+  }
+}
+
+async function listUpdatedWorkspaceFiles(
+  workspace: string,
+  sinceMs: number,
+  limit = GENERATED_FILE_SCAN_LIMIT,
+): Promise<WorkspaceFileCandidate[]> {
+  const cutoff = sinceMs - GENERATED_FILE_MTIME_SKEW_MS;
+  const candidates: WorkspaceFileCandidate[] = [];
+
+  async function visit(directory: string): Promise<void> {
+    if (candidates.length >= limit) return;
+
+    let entries;
+    try {
+      entries = await readdir(directory, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    for (const entry of entries) {
+      if (candidates.length >= limit) return;
+      if (entry.name.startsWith('.') || GENERATED_FILE_SKIP_DIRS.has(entry.name)) continue;
+
+      const absolutePath = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        await visit(absolutePath);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+
+      try {
+        const fileStat = await stat(absolutePath);
+        if (fileStat.size <= 0 || fileStat.size > GENERATED_FILE_MAX_BYTES || fileStat.mtimeMs < cutoff) continue;
+        candidates.push({
+          absolutePath,
+          relativePath: relative(workspace, absolutePath),
+          sizeBytes: fileStat.size,
+          mtimeMs: fileStat.mtimeMs,
+        });
+      } catch {
+        // File may have disappeared while the agent was still writing.
+      }
+    }
+  }
+
+  await visit(workspace);
+  return candidates
+    .filter((candidate) => isImportableWorkspaceFile(candidate.relativePath))
+    .sort((left, right) => right.mtimeMs - left.mtimeMs)
+    .slice(0, limit);
+}
+
+async function snapshotWorkspaceFiles(workspace: string | undefined): Promise<WorkspaceFileSnapshot> {
+  const snapshot: WorkspaceFileSnapshot = new Map();
+  if (!workspace) return snapshot;
+  const workspaceRoot = workspace;
+
+  async function visit(directory: string): Promise<void> {
+    let entries;
+    try {
+      entries = await readdir(directory, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    for (const entry of entries) {
+      if (entry.name.startsWith('.') || GENERATED_FILE_SKIP_DIRS.has(entry.name)) continue;
+      const absolutePath = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        await visit(absolutePath);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+
+      try {
+        const fileStat = await stat(absolutePath);
+        const relativePath = relative(workspaceRoot, absolutePath);
+        if (!isImportableWorkspaceFile(relativePath)) continue;
+        snapshot.set(relativePath, { sizeBytes: fileStat.size, mtimeMs: fileStat.mtimeMs });
+      } catch {
+        // Ignore files that disappear during the snapshot.
+      }
+    }
+  }
+
+  await visit(workspaceRoot);
+  return snapshot;
+}
+
+function hasChangedSinceSnapshot(candidate: WorkspaceFileCandidate, snapshot: WorkspaceFileSnapshot) {
+  const previous = snapshot.get(candidate.relativePath);
+  if (!previous) return true;
+  return previous.sizeBytes !== candidate.sizeBytes || previous.mtimeMs !== candidate.mtimeMs;
+}
+
+function extractMentionedFilePaths(text: string | null | undefined) {
+  if (!text) return [];
+
+  const paths = new Set<string>();
+  const pattern = /[`"“”']?((?:[\p{L}\p{N}._ -]+\/)*[\p{L}\p{N}._ -]+\.([a-zA-Z0-9]{1,8}))[`"“”']?/gu;
+  for (const match of text.matchAll(pattern)) {
+    const path = match[1]?.trim();
+    const extension = match[2]?.toLowerCase();
+    if (!path || !extension || !GENERATED_FILE_EXTENSIONS.has(extension)) continue;
+    if (path.includes('://') || path.startsWith('/') || path.startsWith('..')) continue;
+    if (!isImportableWorkspaceFile(path)) continue;
+    paths.add(path);
+  }
+  return [...paths].slice(0, GENERATED_FILE_SCAN_LIMIT);
+}
+
+async function getMentionedWorkspaceFiles(workspace: string, responseText: string | null | undefined) {
+  const candidates: WorkspaceFileCandidate[] = [];
+  for (const mentionedPath of extractMentionedFilePaths(responseText)) {
+    const resolvedFile = await resolveWorkspaceFile(workspace, mentionedPath);
+    if (!resolvedFile || !isImportableWorkspaceFile(resolvedFile.relativePath)) continue;
+    try {
+      const fileStat = await stat(resolvedFile.absolutePath);
+      if (!fileStat.isFile() || fileStat.size <= 0 || fileStat.size > GENERATED_FILE_MAX_BYTES) continue;
+      candidates.push({
+        absolutePath: resolvedFile.absolutePath,
+        relativePath: resolvedFile.relativePath,
+        sizeBytes: fileStat.size,
+        mtimeMs: fileStat.mtimeMs,
+      });
+    } catch {
+      // The model may mention conceptual filenames that were not actually written.
+    }
+  }
+  return candidates;
+}
+
+async function importGeneratedWorkspaceFiles(
+  task: Task,
+  agent: AgentHandle,
+  fileService: FileAssetService | undefined,
+  stream: StreamHub,
+  sinceMs: number,
+  baseline: WorkspaceFileSnapshot,
+  responseText?: string | null,
+) {
+  if (!fileService || !agent.workspace) return [];
+
+  const existingForTask = fileService.listFiles(task.userId, { taskId: task.id, includeAllVersions: true });
+  const existingByPath = new Map<string, (typeof existingForTask)[number]>();
+  for (const file of existingForTask) {
+    const relativePath = file.summary?.match(/^OpenClaw workspace 文件: (.+)$/)?.[1];
+    if (relativePath && !existingByPath.has(relativePath)) {
+      existingByPath.set(relativePath, file);
+    }
+  }
+  const imported = [];
+  const candidatesByPath = new Map<string, WorkspaceFileCandidate>();
+
+  for (const candidate of await getMentionedWorkspaceFiles(agent.workspace, responseText)) {
+    if (!hasChangedSinceSnapshot(candidate, baseline)) continue;
+    candidatesByPath.set(candidate.relativePath, candidate);
+  }
+  for (const candidate of await listUpdatedWorkspaceFiles(agent.workspace, sinceMs)) {
+    if (!hasChangedSinceSnapshot(candidate, baseline)) continue;
+    candidatesByPath.set(candidate.relativePath, candidate);
+  }
+
+  for (const candidate of candidatesByPath.values()) {
+    const fileName = basename(candidate.relativePath);
+    const previousVersion = existingByPath.get(candidate.relativePath);
+
+    try {
+      const file = fileService.createFileFromArtifact({
+        task,
+        parentFileId: previousVersion?.id,
+        title: fileName,
+        fileName,
+        content: await readFile(candidate.absolutePath),
+        source: 'workspace_imported',
+        summary: `OpenClaw workspace 文件: ${candidate.relativePath}`,
+      });
+      imported.push(file);
+      existingByPath.set(candidate.relativePath, file);
+      stream.broadcast(task.id, { type: 'file.asset.created', data: file });
+    } catch (error) {
+      console.warn('[OpenClawAgent] workspace file import skipped:', error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  return imported;
 }
 
 // ── Agent helpers factory ──
@@ -690,6 +946,7 @@ export async function runOpenClawSession(
   content: string,
   store: MemoryStore,
   stream: StreamHub,
+  fileService?: FileAssetService,
   isFollowup = false,
   parentMessageId?: string,
   sessionService?: SessionService,
@@ -714,12 +971,14 @@ export async function runOpenClawSession(
   try {
     helpers.publishTaskStatus('running');
     store.updateAgentStatus(agent.id, 'running');
+    const runStartedAt = Date.now();
 
     // 1. Ensure Gateway agent exists
     const gatewayAgentId = await ensureGatewayAgent(client, agent, store, helpers);
 
     // 2. Create/reuse main + task session on the Gateway
     const session = await ensureSession(client, gatewayAgentId, store, agent, task);
+    const workspaceBaseline = await snapshotWorkspaceFiles(agent.workspace);
 
     // 3. Publish dispatch event
     if (isFollowup) {
@@ -772,6 +1031,23 @@ export async function runOpenClawSession(
 
     if (responseText) {
       helpers.publishEvent('agent.answer.created', 'Agent 已生成回复', 'success');
+    }
+
+    const importedFiles = await importGeneratedWorkspaceFiles(
+      task,
+      agent,
+      fileService,
+      stream,
+      runStartedAt,
+      workspaceBaseline,
+      responseText,
+    );
+    if (importedFiles.length > 0) {
+      helpers.publishEvent(
+        'agent.files.imported',
+        `已同步 ${importedFiles.length} 个文件到文件空间`,
+        'success',
+      );
     }
 
     helpers.publishTaskStatus('completed');

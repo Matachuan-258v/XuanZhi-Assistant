@@ -286,6 +286,13 @@ test('assistant generated files render as downloadable cards and images use API 
   assert.match(chatCss, /generated-file-preview/, 'expected generated image preview styles');
 });
 
+test('PDF previews do not leak auth tokens through referrers or popup openers', async () => {
+  const preview = await read('src/components/files/FilePreviewModal.tsx');
+
+  assert.match(preview, /referrerPolicy="no-referrer"/, 'expected embedded PDF previews to suppress referrers');
+  assert.match(preview, /noopener,noreferrer/, 'expected detached PDF previews to isolate the opener and suppress referrers');
+});
+
 test('assistant message components rerender when the login token changes', async () => {
   const app = await read('src/App.tsx');
   const shell = await read('src/components/assistant/AssistantShell.tsx');

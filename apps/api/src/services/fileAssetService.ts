@@ -41,6 +41,7 @@ type FileLookup = {
 type CreateFileAssetInput = {
   task: Task;
   artifactId?: string;
+  parentFileId?: string;
   title: string;
   type?: ArtifactType;
   format?: ArtifactFormat;
@@ -693,6 +694,20 @@ export function createFileAssetService(store: MemoryStore) {
 
     withIndexLock(indexPath, () => {
       const index = readIndex(indexPath);
+      const parentFile = input.parentFileId
+        ? index.files.find((file) => file.id === input.parentFileId && file.userId === input.task.userId)
+        : undefined;
+      if (input.parentFileId && !parentFile) {
+        throw new Error('父版本文件不存在');
+      }
+      const versionGroupId = parentFile?.versionGroupId ?? parentFile?.id ?? fileAsset.id;
+      const version = parentFile ? nextVersion(index, versionGroupId) : 1;
+      fileAsset = {
+        ...fileAsset,
+        versionGroupId,
+        version,
+        parentFileId: parentFile?.id,
+      };
       const duplicate = findDuplicate(index, input.task.userId, hash, fileAsset.id);
       if (duplicate) {
         fileAsset = { ...fileAsset, duplicateOfFileId: duplicate.id };
@@ -701,9 +716,9 @@ export function createFileAssetService(store: MemoryStore) {
       recordActivity(index, {
         fileId: fileAsset.id,
         userId: fileAsset.userId,
-        type: 'created',
-        message: 'AI 生成文件',
-        metadata: { taskId: input.task.id, artifactId: input.artifactId },
+        type: parentFile ? 'version_created' : 'created',
+        message: parentFile ? `AI 生成第 ${version} 版文件` : 'AI 生成文件',
+        metadata: { taskId: input.task.id, artifactId: input.artifactId, parentFileId: parentFile?.id },
       });
       writeIndex(indexPath, index);
     });

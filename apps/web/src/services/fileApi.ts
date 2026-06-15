@@ -193,6 +193,13 @@ export function getFileDownloadUrl(fileId: string) {
   return apiUrl(`/api/files/${fileId}/download${token ? `?token=${encodeURIComponent(token)}` : ''}`);
 }
 
+export function getFileInlineUrl(fileId: string) {
+  const token = getAuthToken();
+  const params = new URLSearchParams({ inline: '1' });
+  if (token) params.set('token', token);
+  return apiUrl(`/api/files/${fileId}/download?${params.toString()}`);
+}
+
 export function getPublicFileDownloadUrl(shareToken: string) {
   return new URL(
     apiUrl(`/api/file-shares/${encodeURIComponent(shareToken)}/download`),

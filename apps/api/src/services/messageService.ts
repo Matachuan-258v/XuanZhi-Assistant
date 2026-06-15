@@ -14,6 +14,8 @@ export function createMessageService(
   sessionService?: SessionService,
   fileService?: FileAssetService,
 ) {
+  const agentRunQueues = new Map<string, Promise<void>>();
+
   function titleFromMessage(content: string) {
     return content.trim().replace(/\s+/g, ' ').slice(0, 28);
   }
@@ -48,8 +50,19 @@ export function createMessageService(
     stream.broadcast(task.id, { type: 'agent.event.created', data: event });
   };
 
-  const runAgent = (task: Task, handler: () => Promise<void> | void) => {
-    void Promise.resolve(handler()).catch((error) => handleRuntimeFailure(task, error));
+  const runAgent = (task: Task, queueKey: string, handler: () => Promise<void> | void) => {
+    const previous = agentRunQueues.get(queueKey) ?? Promise.resolve();
+    const execution = previous
+      .catch(() => undefined)
+      .then(() => handler());
+    const tracked = execution
+      .catch((error) => handleRuntimeFailure(task, error))
+      .finally(() => {
+        if (agentRunQueues.get(queueKey) === tracked) {
+          agentRunQueues.delete(queueKey);
+        }
+      });
+    agentRunQueues.set(queueKey, tracked);
   };
 
   function findLastAssistantIndex(messages: Array<{ role: Message['role'] }>) {
@@ -234,6 +247,7 @@ export function createMessageService(
         const runtimeContent = contextText
           ? `${message.content}\n\n---\n以下文件已加入本轮上下文：\n${contextText}`
           : message.content;
+        const queueKey = agent?.workspace || agent?.id || activeTask.userId;
 
         if (input.contextFileIds?.length && fileService) {
           fileService.recordUsedInChat(activeTask.userId, input.contextFileIds, activeTask.id);
@@ -241,16 +255,34 @@ export function createMessageService(
 
         if (client.isConnected()) {
           const isFollowup = !!agent?.gatewayAgentId;
-          runAgent(activeTask, () =>
-            runOpenClawSession(activeTask, runtimeContent, store, stream, isFollowup, message.id, sessionService),
+          runAgent(activeTask, queueKey, () =>
+            runOpenClawSession(
+              activeTask,
+              runtimeContent,
+              store,
+              stream,
+              fileService,
+              isFollowup,
+              message.id,
+              sessionService,
+            ),
           );
         } else {
           // OpenClaw 未连接，先触发连接再执行
-          runAgent(activeTask, async () => {
+          runAgent(activeTask, queueKey, async () => {
             await client.connect();
             const freshAgent = activeTask.agentId ? store.getAgent(activeTask.agentId) : store.getAgentByUserId(activeTask.userId);
             const isFollowup = !!freshAgent?.gatewayAgentId;
-            await runOpenClawSession(activeTask, runtimeContent, store, stream, isFollowup, message.id, sessionService);
+            await runOpenClawSession(
+              activeTask,
+              runtimeContent,
+              store,
+              stream,
+              fileService,
+              isFollowup,
+              message.id,
+              sessionService,
+            );
           });
         }
       }
