@@ -87,6 +87,7 @@ export function AssistantShell({ currentUser, token, onLogout }: AssistantShellP
   const [inputValue, setInputValue] = useState('');
   const [tasks, setTasks] = useState<Task[]>([]);
   const [messagesByTask, setMessagesByTask] = useState<Record<string, Message[]>>({});
+  const [taskSnapshotsLoaded, setTaskSnapshotsLoaded] = useState<Record<string, boolean>>({});
   const [approvalsByTask, setApprovalsByTask] = useState<Record<string, Approval[]>>({});
   const [_eventsByTask, setEventsByTask] = useState<Record<string, AgentEvent[]>>({});
   const [files, setFiles] = useState<FileAsset[]>([]);
@@ -101,6 +102,7 @@ export function AssistantShell({ currentUser, token, onLogout }: AssistantShellP
   // 同一时间只订阅当前任务的 SSE，切换任务或登出时立即关闭，避免旧任务事件写入新视图。
   const streamCleanupRef = useRef<(() => void) | undefined>(undefined);
   const streamGenerationRef = useRef(0);
+  const conversationCreationInFlightRef = useRef(false);
 
   const closeStream = useCallback(() => {
     streamGenerationRef.current += 1;
@@ -179,6 +181,7 @@ export function AssistantShell({ currentUser, token, onLogout }: AssistantShellP
       taskFiles.forEach((file) => byId.set(file.id, file));
       return [...byId.values()].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
     });
+    setTaskSnapshotsLoaded((current) => ({ ...current, [taskId]: true }));
 
     return task;
   }, []);
@@ -216,6 +219,7 @@ export function AssistantShell({ currentUser, token, onLogout }: AssistantShellP
     async (taskId: string) => {
       closeStream();
       const streamGeneration = streamGenerationRef.current;
+      setTaskSnapshotsLoaded((current) => ({ ...current, [taskId]: false }));
       setActiveTaskId(taskId);
       setWorkspaceView('chat');
       try {
@@ -387,6 +391,20 @@ export function AssistantShell({ currentUser, token, onLogout }: AssistantShellP
   );
 
   const createConversation = useCallback(async () => {
+    const activeEmptyConversation = activeAgentTasks.find((task) => (
+      task.id === activeTaskId
+      && !isMainTask(task)
+      && taskSnapshotsLoaded[task.id] === true
+      && (messagesByTask[task.id]?.length ?? 0) === 0
+    ));
+    if (activeEmptyConversation) {
+      setWorkspaceView('chat');
+      return;
+    }
+    if (conversationCreationInFlightRef.current) {
+      return;
+    }
+
     closeStream();
     setInputValue('');
     if (!activeAgentId || activeAgentId === DEFAULT_AGENT_ID) {
@@ -394,6 +412,8 @@ export function AssistantShell({ currentUser, token, onLogout }: AssistantShellP
       setWorkspaceView('home');
       return;
     }
+
+    conversationCreationInFlightRef.current = true;
     try {
       const task = await agentApi.createConversation(activeAgentId);
       setTasks((current) => upsertById(current, task));
@@ -407,8 +427,19 @@ export function AssistantShell({ currentUser, token, onLogout }: AssistantShellP
       toast.error(error instanceof Error ? error.message : '创建新对话失败');
       setActiveTaskId(undefined);
       setWorkspaceView('home');
+    } finally {
+      conversationCreationInFlightRef.current = false;
     }
-  }, [activeAgentId, closeStream, openTask, refreshTasks]);
+  }, [
+    activeAgentId,
+    activeAgentTasks,
+    activeTaskId,
+    closeStream,
+    messagesByTask,
+    openTask,
+    refreshTasks,
+    taskSnapshotsLoaded,
+  ]);
 
   const openAgentMainTask = useCallback(
     async (agentId: string) => {
@@ -581,6 +612,7 @@ export function AssistantShell({ currentUser, token, onLogout }: AssistantShellP
     closeStream();
     setTasks([]);
     setMessagesByTask({});
+    setTaskSnapshotsLoaded({});
     setApprovalsByTask({});
     setEventsByTask({});
     setFiles([]);
@@ -602,10 +634,16 @@ export function AssistantShell({ currentUser, token, onLogout }: AssistantShellP
   const activeAgentName = activeAgent?.profile?.agentName || activeAgent?.name || '玄知助手';
   const needsAgentSetup = Boolean(pendingInitialSetup && activeAgent && !activeAgent.profile);
   const activeMessages = activeTaskId ? messagesByTask[activeTaskId] ?? [] : [];
+  const activeTaskSnapshotLoaded = activeTaskId ? taskSnapshotsLoaded[activeTaskId] === true : false;
   const activeFiles = activeTaskId ? filesByTask[activeTaskId] ?? [] : [];
   const activeApprovals = activeTaskId ? approvalsByTask[activeTaskId] ?? [] : [];
   const activePendingApprovals = activeApprovals.filter((approval) => approval.status === 'pending');
   const isChatting = Boolean(activeTask);
+  const showConversationHome = Boolean(
+    activeTask
+    && activeTaskSnapshotLoaded
+    && activeMessages.length === 0
+  );
   const isAgentPicker = workspaceView === 'agent-picker' || needsAgentSetup;
   const isFileSpace = workspaceView === 'file';
   const isTeamSpace = workspaceView === 'team';
@@ -675,7 +713,7 @@ export function AssistantShell({ currentUser, token, onLogout }: AssistantShellP
                   }
                 }}
               />
-          ) : isChatting && activeTask ? (
+          ) : isChatting && activeTask && !showConversationHome ? (
             <section className="task-chat-column">
               <ChatPanel
                 files={activeFiles}
@@ -697,7 +735,7 @@ export function AssistantShell({ currentUser, token, onLogout }: AssistantShellP
           )}
         </div>
 
-        {isChatting && !isFileSpace && !isTeamSpace ? (
+        {isChatting && !showConversationHome && !isFileSpace && !isTeamSpace ? (
           <footer className="composer-area">
             <div className="composer-stack">
               {contextFiles.length > 0 ? (

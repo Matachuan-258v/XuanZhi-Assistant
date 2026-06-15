@@ -166,6 +166,42 @@ test('task streams are isolated when switching conversations', async () => {
   assert.doesNotMatch(chatCanvas, /typing:\s*\{\s*effect:\s*'typing'/, 'expected historical assistant messages not to replay typing on conversation switch');
 });
 
+test('loaded empty conversations reuse the assistant home instead of an empty message list', async () => {
+  const shell = await read('src/components/assistant/AssistantShell.tsx');
+
+  assert.match(shell, /taskSnapshotsLoaded/, 'expected task snapshot loading to be tracked');
+  assert.match(
+    shell,
+    /showConversationHome\s*=\s*Boolean\([\s\S]*activeTaskSnapshotLoaded[\s\S]*activeMessages\.length === 0/,
+    'expected loaded conversations without messages to select the assistant home',
+  );
+  assert.match(
+    shell,
+    /isChatting && activeTask && !showConversationHome/,
+    'expected the message panel to render only after the conversation has messages',
+  );
+  assert.match(
+    shell,
+    /isChatting && !showConversationHome && !isFileSpace && !isTeamSpace/,
+    'expected the chat footer composer to stay hidden while the assistant home composer is visible',
+  );
+});
+
+test('starting a conversation reuses the current empty child conversation', async () => {
+  const shell = await read('src/components/assistant/AssistantShell.tsx');
+  const reuseCheckIndex = shell.indexOf('if (activeEmptyConversation)');
+  const createRequestIndex = shell.indexOf('await agentApi.createConversation(activeAgentId)');
+
+  assert.match(shell, /conversationCreationInFlightRef/, 'expected rapid new-conversation clicks to be deduplicated');
+  assert.match(
+    shell,
+    /activeEmptyConversation\s*=\s*activeAgentTasks\.find\([\s\S]*!isMainTask\(task\)[\s\S]*taskSnapshotsLoaded\[task\.id\] === true[\s\S]*messagesByTask\[task\.id\][\s\S]*length === 0/,
+    'expected only the loaded empty active child conversation to be reusable',
+  );
+  assert.ok(reuseCheckIndex >= 0, 'expected an early return for the current empty conversation');
+  assert.ok(createRequestIndex > reuseCheckIndex, 'expected empty-conversation reuse before the backend create request');
+});
+
 test('chat canvas stays pinned to the latest message while streaming', async () => {
   const chatCanvas = await read('src/components/chat/ChatCanvas.tsx');
   const chatCss = await read('src/styles/chat.css');
