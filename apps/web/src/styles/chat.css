@@ -207,10 +207,9 @@
 
 .task-file-strip {
   display: grid;
-  width: min(var(--chat-surface-width), 100%);
   gap: 10px;
-  margin: 0 auto 22px;
-  padding: 0 0 4px;
+  margin-top: 2px;
+  padding: 0;
 }
 
 .task-file-strip-header {
@@ -229,7 +228,7 @@
 
 .task-file-strip-list {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
   gap: 10px;
 }
 

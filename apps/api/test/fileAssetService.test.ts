@@ -69,6 +69,21 @@ describe('file asset service', () => {
     );
   });
 
+  it('stores the source assistant message id for generated files', () => {
+    const task = makeTask(store);
+    const file = files.createFileFromArtifact({
+      task,
+      messageId: 'msg_assistant_1',
+      title: '消息附件',
+      type: 'report',
+      format: 'markdown',
+      content: '# 消息附件',
+    });
+
+    expect(file.messageId).toBe('msg_assistant_1');
+    expect(files.listFiles(task.userId, { taskId: task.id })[0]?.messageId).toBe('msg_assistant_1');
+  });
+
   it('does not expose deleted shared files to non-owners', () => {
     const task = makeTask(store);
     const file = files.createFileFromArtifact({

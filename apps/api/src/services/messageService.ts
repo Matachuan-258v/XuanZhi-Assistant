@@ -72,6 +72,65 @@ export function createMessageService(
     return -1;
   }
 
+  function messageTime(message: Message) {
+    const parsed = Date.parse(message.createdAt);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  function sortMessagesForDisplay(messages: Message[]) {
+    const baseOrder = messages
+      .map((message, index) => ({ message, index }))
+      .sort((left, right) => {
+        const timeDelta = messageTime(left.message) - messageTime(right.message);
+        return timeDelta || left.index - right.index;
+      });
+    const baseRank = new Map(baseOrder.map((item, index) => [item.message.id, index]));
+    const byId = new Map(messages.map((message) => [message.id, message]));
+    const childrenByParent = new Map<string, Message[]>();
+    const incomingCount = new Map(messages.map((message) => [message.id, 0]));
+
+    for (const message of messages) {
+      if (!message.parentMessageId || !byId.has(message.parentMessageId)) {
+        continue;
+      }
+      childrenByParent.set(message.parentMessageId, [
+        ...(childrenByParent.get(message.parentMessageId) ?? []),
+        message,
+      ]);
+      incomingCount.set(message.id, (incomingCount.get(message.id) ?? 0) + 1);
+    }
+
+    const sorted: Message[] = [];
+    const ready = baseOrder
+      .map((item) => item.message)
+      .filter((message) => (incomingCount.get(message.id) ?? 0) === 0);
+
+    while (ready.length > 0) {
+      ready.sort((left, right) => (baseRank.get(left.id) ?? 0) - (baseRank.get(right.id) ?? 0));
+      const message = ready.shift()!;
+      sorted.push(message);
+
+      for (const child of childrenByParent.get(message.id) ?? []) {
+        const nextCount = (incomingCount.get(child.id) ?? 0) - 1;
+        incomingCount.set(child.id, nextCount);
+        if (nextCount === 0) {
+          ready.push(child);
+        }
+      }
+    }
+
+    if (sorted.length !== messages.length) {
+      const emitted = new Set(sorted.map((message) => message.id));
+      for (const item of baseOrder) {
+        if (!emitted.has(item.message.id)) {
+          sorted.push(item.message);
+        }
+      }
+    }
+
+    return sorted;
+  }
+
   function mergeMessages(diskMessages: Message[], localMessages: Message[]) {
     const merged: Message[] = [];
     const seenIds = new Set<string>();
@@ -94,16 +153,45 @@ export function createMessageService(
     const canonicalParentId = (message: Message) => canonicalId(message.parentMessageId);
     const planStepCount = (message: Message) => message.planSteps?.length ?? 0;
     const toolCallCount = (message: Message) => message.toolCalls?.length ?? 0;
+    const withinMirrorWindow = (left: Message, right: Message) => {
+      const leftMs = Date.parse(left.createdAt);
+      const rightMs = Date.parse(right.createdAt);
+      if (!Number.isFinite(leftMs) || !Number.isFinite(rightMs)) {
+        return false;
+      }
+      return Math.abs(leftMs - rightMs) <= mirrorWindowMs;
+    };
+    const hasRuntimeState = (message: Message) => (
+      message.status === 'streaming'
+      || planStepCount(message) > 0
+      || toolCallCount(message) > 0
+    );
+    const isParentlessAssistantMirror = (candidate: Message, message: Message) => {
+      if (candidate.role !== 'assistant' || message.role !== 'assistant') return false;
+      const candidateParent = canonicalParentId(candidate);
+      const messageParent = canonicalParentId(message);
+      if (!candidateParent && !messageParent) return false;
+      if (candidateParent && messageParent) return candidateParent === messageParent;
+
+      const parented = candidateParent ? candidate : message;
+      const orphan = candidateParent ? message : candidate;
+      if (!hasRuntimeState(parented)) return false;
+      if (!orphan.content.trim()) return false;
+      return withinMirrorWindow(parented, orphan);
+    };
     const mergeMirroredMessage = (current: Message, next: Message): Message => {
+      const parentMessageId = canonicalId(current.parentMessageId ?? next.parentMessageId);
       if (
         toolCallCount(next) > toolCallCount(current)
         || (toolCallCount(next) === toolCallCount(current) && planStepCount(next) > planStepCount(current))
       ) {
+        const mergedContent = current.content.trim() ? current.content : next.content;
         return {
           ...next,
           id: current.id,
+          content: mergedContent,
           createdAt: current.createdAt,
-          parentMessageId: current.parentMessageId ?? next.parentMessageId,
+          parentMessageId,
         };
       }
 
@@ -111,13 +199,20 @@ export function createMessageService(
         (toolCallCount(current) > 0 && toolCallCount(next) === 0)
         || (planStepCount(current) > 0 && planStepCount(next) === 0)
       ) {
-        return current;
+        const merged = current.content.trim() ? current : { ...current, content: next.content };
+        return parentMessageId ? { ...merged, parentMessageId } : merged;
       }
 
-      return current.status === 'streaming' && next.status === 'completed'
-        ? { ...current, status: next.status }
+      const merged = current.status === 'streaming' && next.status === 'completed'
+        ? { ...current, status: next.status, content: next.content.trim() ? next.content : current.content }
         : current;
+      return parentMessageId ? { ...merged, parentMessageId } : merged;
     };
+    const rewriteParentAliases = (messages: Message[]) => messages.map((message) => {
+      const parentMessageId = canonicalId(message.parentMessageId);
+      if (!parentMessageId || parentMessageId === message.parentMessageId) return message;
+      return { ...message, parentMessageId };
+    });
 
     for (const message of [...diskMessages, ...localMessages]) {
       if (seenIds.has(message.id)) {
@@ -140,13 +235,23 @@ export function createMessageService(
         continue;
       }
 
+      const orphanAssistantMirrorIndex = message.role === 'assistant'
+        ? merged.findIndex((candidate) => (
+          isParentlessAssistantMirror(candidate, message)
+        ))
+        : -1;
+      if (orphanAssistantMirrorIndex >= 0) {
+        const keptId = merged[orphanAssistantMirrorIndex]!.id;
+        merged[orphanAssistantMirrorIndex] = mergeMirroredMessage(merged[orphanAssistantMirrorIndex]!, message);
+        idAliases.set(message.id, keptId);
+        seenIds.add(message.id);
+        continue;
+      }
+
       const mirroredIndex = merged.findIndex((candidate) => {
         if (mirrorKey(candidate) !== key) return false;
-        const candidateCreatedAtMs = Date.parse(candidate.createdAt);
-        if (!Number.isFinite(createdAtMs) || !Number.isFinite(candidateCreatedAtMs)) {
-          return true;
-        }
-        return Math.abs(createdAtMs - candidateCreatedAtMs) <= mirrorWindowMs;
+        if (!Number.isFinite(createdAtMs)) return true;
+        return withinMirrorWindow(candidate, message);
       });
 
       if (mirroredIndex >= 0) {
@@ -166,9 +271,7 @@ export function createMessageService(
       merged.push(message);
     }
 
-    return merged.sort((left, right) => (
-      Date.parse(left.createdAt) - Date.parse(right.createdAt)
-    ));
+    return sortMessagesForDisplay(rewriteParentAliases(merged));
   }
 
   function readOpenClawDiskMessages(task: Task): Message[] {

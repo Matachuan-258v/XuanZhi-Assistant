@@ -151,6 +151,7 @@ export type FileAsset = {
   id: string;
   userId: string;
   taskId?: string;
+  messageId?: string;
   agentId?: string;
   artifactId?: string;
   versionGroupId: string;

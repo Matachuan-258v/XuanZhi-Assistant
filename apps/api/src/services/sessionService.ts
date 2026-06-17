@@ -265,6 +265,7 @@ function parseJsonlLine(line: string, index: number): SessionMessage | null {
 export function parseOpenClawSessionMessages(text: string): SessionMessage[] {
   const messages: SessionMessage[] = [];
   let assistantTurn: SessionMessage | undefined;
+  let lastUserMessageId: string | undefined;
 
   const flushAssistantTurn = () => {
     if (!assistantTurn) return;
@@ -301,13 +302,15 @@ export function parseOpenClawSessionMessages(text: string): SessionMessage[] {
       flushAssistantTurn();
       const userText = stripRawToolPayloads(extractTextContent(content));
       if (!userText.trim()) continue;
+      const id = raw.id || `session-user-${index}`;
       messages.push({
-        id: raw.id || `session-user-${index}`,
+        id,
         role: 'user',
         content: userText,
         parentMessageId: raw.parentId,
         createdAt,
       });
+      lastUserMessageId = id;
       continue;
     }
 
@@ -321,7 +324,7 @@ export function parseOpenClawSessionMessages(text: string): SessionMessage[] {
           id: raw.id || `session-assistant-${index}`,
           role: 'assistant',
           content: '',
-          parentMessageId: raw.parentId,
+          parentMessageId: raw.parentId ?? lastUserMessageId,
           createdAt,
           toolCalls: [],
         };
@@ -345,7 +348,7 @@ export function parseOpenClawSessionMessages(text: string): SessionMessage[] {
           id: raw.parentId || raw.id || `session-assistant-${index}`,
           role: 'assistant',
           content: '',
-          parentMessageId: raw.parentId,
+          parentMessageId: raw.parentId ?? lastUserMessageId,
           createdAt,
           toolCalls: [],
         };

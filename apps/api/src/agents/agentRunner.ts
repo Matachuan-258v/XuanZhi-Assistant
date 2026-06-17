@@ -374,6 +374,7 @@ async function importGeneratedWorkspaceFiles(
   stream: StreamHub,
   sinceMs: number,
   baseline: WorkspaceFileSnapshot,
+  messageId?: string,
   responseText?: string | null,
 ) {
   if (!fileService || !agent.workspace) return [];
@@ -405,6 +406,7 @@ async function importGeneratedWorkspaceFiles(
     try {
       const file = fileService.createFileFromArtifact({
         task,
+        messageId,
         parentFileId: previousVersion?.id,
         title: fileName,
         fileName,
@@ -1040,6 +1042,7 @@ export async function runOpenClawSession(
       stream,
       runStartedAt,
       workspaceBaseline,
+      messageId,
       responseText,
     );
     if (importedFiles.length > 0) {

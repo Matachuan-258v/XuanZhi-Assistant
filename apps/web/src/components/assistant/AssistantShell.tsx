@@ -9,7 +9,9 @@ import { subscribeTaskStream } from '../../services/streamClient';
 import * as taskApi from '../../services/taskApi';
 import {
   replaceTaskRecord,
+  replaceTaskMessagesRecord,
   upsertById,
+  upsertTaskMessageRecordItem,
   upsertTaskRecordItem,
 } from '../../stores/taskStore';
 import type { Agent, AgentEvent, Approval, FileAsset, FileAssetCategory, FileFolder, Message, StreamEvent, Task, User } from '../../types/protocol';
@@ -117,7 +119,7 @@ export function AssistantShell({ currentUser, token, onLogout }: AssistantShellP
         break;
       case 'message.created':
       case 'message.updated':
-        setMessagesByTask((current) => upsertTaskRecordItem(current, event.data.taskId, event.data));
+        setMessagesByTask((current) => upsertTaskMessageRecordItem(current, event.data.taskId, event.data));
         break;
       case 'agent.event.created':
       case 'agent.event.updated':
@@ -173,7 +175,7 @@ export function AssistantShell({ currentUser, token, onLogout }: AssistantShellP
     ]);
 
     setTasks((current) => upsertById(current, task));
-    setMessagesByTask((current) => replaceTaskRecord(current, taskId, messages));
+    setMessagesByTask((current) => replaceTaskMessagesRecord(current, taskId, messages));
     setApprovalsByTask((current) => replaceTaskRecord(current, taskId, approvals));
     setFilesByTask((current) => replaceTaskRecord(current, taskId, taskFiles));
     setFiles((current) => {
@@ -363,7 +365,7 @@ export function AssistantShell({ currentUser, token, onLogout }: AssistantShellP
           question,
           contextFiles.map((file) => file.id),
         );
-        setMessagesByTask((current) => upsertTaskRecordItem(current, task.id, createdMessage));
+        setMessagesByTask((current) => upsertTaskMessageRecordItem(current, task.id, createdMessage));
         setContextFiles([]);
         // OpenClaw Gateway 的首轮事件可能早于浏览器完成 SSE 建连；这里主动刷新一次快照。
         await loadTaskSnapshot(task.id);

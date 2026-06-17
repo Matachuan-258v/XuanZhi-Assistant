@@ -1087,7 +1087,103 @@ describe('xuanzhi api with OpenClaw Gateway', () => {
 
     expect(merged.map((message) => message.role)).toEqual(['user', 'assistant']);
     expect(merged.map((message) => message.content)).toEqual(localMessages.map((message) => message.content));
+    expect(merged[1]?.parentMessageId).toBe(merged[0]?.id);
     expect(merged[1]?.planSteps).toEqual(localMessages[1]?.planSteps);
+  });
+
+  it('keeps live user prompts above parentless disk final answers after refresh', async () => {
+    const userA = await login(app, 'alice');
+    const agentId = userA.agent?.id;
+    expect(agentId).toBeTruthy();
+
+    const mainResponse = await app.inject({
+      method: 'POST',
+      url: `/api/agents/${agentId}/main-task`,
+      headers: { authorization: `Bearer ${userA.token}` },
+    });
+    const mainTask = mainResponse.json<Task>();
+    const gatewayAgentId = mainTask.sessionKey?.split(':')[1];
+    expect(gatewayAgentId).toBeTruthy();
+
+    const conversationResponse = await app.inject({
+      method: 'POST',
+      url: `/api/agents/${agentId}/conversations`,
+      headers: { authorization: `Bearer ${userA.token}` },
+      payload: { title: 'Parentless final refresh' },
+    });
+    const childTask = conversationResponse.json<Task>();
+
+    await sendUserMessage(app, userA.token, childTask.id, 'Mirror tool');
+    await waitForCondition(async () => {
+      const taskResponse = await app.inject({
+        method: 'GET',
+        url: `/api/tasks/${childTask.id}`,
+        headers: { authorization: `Bearer ${userA.token}` },
+      });
+      expect(taskResponse.json<Task>().status).toBe('completed');
+    });
+
+    const liveResponse = await app.inject({
+      method: 'GET',
+      url: `/api/tasks/${childTask.id}/messages`,
+      headers: { authorization: `Bearer ${userA.token}` },
+    });
+    const liveMessages = liveResponse.json<Message[]>();
+    expect(liveMessages.map((message) => message.role)).toEqual(['user', 'assistant']);
+    expect(liveMessages[1]?.planSteps).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ text: expect.stringContaining('read: IDENTITY.md'), status: 'done' }),
+      ]),
+    );
+
+    const sessionId = 'parentless-final-refresh-session-1';
+    const sessionsDir = join(workspaceRoot, 'agents', gatewayAgentId!, 'sessions');
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(
+      join(sessionsDir, 'sessions.json'),
+      JSON.stringify({
+        [childTask.sessionKey!]: {
+          key: childTask.sessionKey,
+          sessionId,
+          title: childTask.title,
+          status: 'completed',
+          updatedAt: Date.now(),
+          sessionStartedAt: Date.now(),
+        },
+      }),
+      'utf8',
+    );
+    writeFileSync(
+      join(sessionsDir, `${sessionId}.jsonl`),
+      [
+        JSON.stringify({
+          type: 'message',
+          id: 'disk-refresh-user',
+          timestamp: new Date(Date.parse(liveMessages[0]!.createdAt) + 1_000).toISOString(),
+          message: { role: 'user', content: [{ type: 'text', text: liveMessages[0]!.content }] },
+        }),
+        JSON.stringify({
+          type: 'message',
+          id: 'disk-refresh-assistant',
+          timestamp: new Date(Date.parse(liveMessages[1]!.createdAt) + 1_000).toISOString(),
+          message: { role: 'assistant', content: [{ type: 'text', text: 'Disk final document is ready.' }] },
+        }),
+      ].join('\n'),
+      'utf8',
+    );
+
+    const mergedResponse = await app.inject({
+      method: 'GET',
+      url: `/api/tasks/${childTask.id}/messages`,
+      headers: { authorization: `Bearer ${userA.token}` },
+    });
+    const merged = mergedResponse.json<Message[]>();
+
+    expect(merged.map((message) => message.role)).toEqual(['user', 'assistant']);
+    expect(merged[0]?.content).toBe(liveMessages[0]?.content);
+    expect(merged[1]?.content).toBe('Disk final document is ready.');
+    expect(merged[1]?.parentMessageId).toBe(merged[0]?.id);
+    expect(merged[1]?.planSteps).toEqual(liveMessages[1]?.planSteps);
   });
 
   it('restores structured OpenClaw tool calls from session jsonl messages', async () => {
@@ -1195,6 +1291,132 @@ describe('xuanzhi api with OpenClaw Gateway', () => {
     expect(messages[1]?.planSteps).toEqual([
       expect.objectContaining({ id: 'call-read-1', text: expect.stringContaining('read: IDENTITY.md') }),
     ]);
+  });
+
+  it('keeps the user prompt before its assistant reply when OpenClaw disk timestamps are skewed', async () => {
+    const userA = await login(app, 'alice');
+    const agentId = userA.agent?.id;
+    expect(agentId).toBeTruthy();
+
+    const conversationResponse = await app.inject({
+      method: 'POST',
+      url: `/api/agents/${agentId}/conversations`,
+      headers: { authorization: `Bearer ${userA.token}` },
+      payload: { title: 'Skewed timestamp history' },
+    });
+    const childTask = conversationResponse.json<Task>();
+    const gatewayAgentId = childTask.sessionKey?.split(':')[1];
+    expect(gatewayAgentId).toBeTruthy();
+
+    const sessionId = 'skewed-timestamp-session-1';
+    const sessionsDir = join(workspaceRoot, 'agents', gatewayAgentId!, 'sessions');
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(
+      join(sessionsDir, 'sessions.json'),
+      JSON.stringify({
+        [childTask.sessionKey!]: {
+          key: childTask.sessionKey,
+          sessionId,
+          title: childTask.title,
+          status: 'completed',
+          updatedAt: Date.now(),
+          sessionStartedAt: Date.now(),
+        },
+      }),
+      'utf8',
+    );
+    writeFileSync(
+      join(sessionsDir, `${sessionId}.jsonl`),
+      [
+        JSON.stringify({
+          type: 'message',
+          id: 'skewed-user',
+          timestamp: '2026-01-01T00:00:10.000Z',
+          message: { role: 'user', content: [{ type: 'text', text: 'Generate a PQC document' }] },
+        }),
+        JSON.stringify({
+          type: 'message',
+          id: 'skewed-assistant',
+          parentId: 'skewed-user',
+          timestamp: '2026-01-01T00:00:01.000Z',
+          message: { role: 'assistant', content: [{ type: 'text', text: 'I will generate the PQC document.' }] },
+        }),
+      ].join('\n'),
+      'utf8',
+    );
+
+    const messagesResponse = await app.inject({
+      method: 'GET',
+      url: `/api/tasks/${childTask.id}/messages`,
+      headers: { authorization: `Bearer ${userA.token}` },
+    });
+    const messages = messagesResponse.json<Message[]>();
+
+    expect(messages.map((message) => message.role)).toEqual(['user', 'assistant']);
+    expect(messages[0]?.content).toBe('Generate a PQC document');
+    expect(messages[1]?.content).toBe('I will generate the PQC document.');
+  });
+
+  it('keeps assistant replies after their preceding disk user message without explicit parent ids', async () => {
+    const userA = await login(app, 'alice');
+    const agentId = userA.agent?.id;
+    expect(agentId).toBeTruthy();
+
+    const conversationResponse = await app.inject({
+      method: 'POST',
+      url: `/api/agents/${agentId}/conversations`,
+      headers: { authorization: `Bearer ${userA.token}` },
+      payload: { title: 'Parentless disk history' },
+    });
+    const childTask = conversationResponse.json<Task>();
+    const gatewayAgentId = childTask.sessionKey?.split(':')[1];
+    expect(gatewayAgentId).toBeTruthy();
+
+    const sessionId = 'parentless-disk-session-1';
+    const sessionsDir = join(workspaceRoot, 'agents', gatewayAgentId!, 'sessions');
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(
+      join(sessionsDir, 'sessions.json'),
+      JSON.stringify({
+        [childTask.sessionKey!]: {
+          key: childTask.sessionKey,
+          sessionId,
+          title: childTask.title,
+          status: 'completed',
+          updatedAt: Date.now(),
+          sessionStartedAt: Date.now(),
+        },
+      }),
+      'utf8',
+    );
+    writeFileSync(
+      join(sessionsDir, `${sessionId}.jsonl`),
+      [
+        JSON.stringify({
+          type: 'message',
+          id: 'parentless-user',
+          timestamp: '2026-01-01T00:00:10.000Z',
+          message: { role: 'user', content: [{ type: 'text', text: 'Create a database document' }] },
+        }),
+        JSON.stringify({
+          type: 'message',
+          id: 'parentless-assistant',
+          timestamp: '2026-01-01T00:00:01.000Z',
+          message: { role: 'assistant', content: [{ type: 'text', text: 'The database document is ready.' }] },
+        }),
+      ].join('\n'),
+      'utf8',
+    );
+
+    const messagesResponse = await app.inject({
+      method: 'GET',
+      url: `/api/tasks/${childTask.id}/messages`,
+      headers: { authorization: `Bearer ${userA.token}` },
+    });
+    const messages = messagesResponse.json<Message[]>();
+
+    expect(messages.map((message) => message.role)).toEqual(['user', 'assistant']);
+    expect(messages[1]?.parentMessageId).toBe(messages[0]?.id);
   });
 
   it('merges live assistant messages with disk history by parent user message', async () => {
@@ -1828,11 +2050,18 @@ describe('xuanzhi api with OpenClaw Gateway', () => {
       url: `/api/tasks/${task.id}/file-assets`,
       headers: { authorization: `Bearer ${userA.token}` },
     });
+    const messagesResponse = await app.inject({
+      method: 'GET',
+      url: `/api/tasks/${task.id}/messages`,
+      headers: { authorization: `Bearer ${userA.token}` },
+    });
+    const assistantMessage = messagesResponse.json<Message[]>().find((message) => message.role === 'assistant');
 
     expect(filesResponse.json<FileAsset[]>()).toEqual([
       expect.objectContaining({
         title: 'report.pdf',
         source: 'workspace_imported',
+        messageId: assistantMessage?.id,
       }),
     ]);
   });

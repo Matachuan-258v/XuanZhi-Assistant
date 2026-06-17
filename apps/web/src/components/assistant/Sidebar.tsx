@@ -78,11 +78,6 @@ const fileCategories: Array<{ key: FileAssetCategory | 'all'; label: string; ico
 const settingsMenuItems = [
   { key: 'general', label: '通用设置', icon: <Icon name="settings" /> },
   { key: 'agent-profile', label: '智能体配置', icon: <Icon name="tool" /> },
-  { key: 'usage', label: '用量统计', icon: <Icon name="check-circle" /> },
-  { key: 'skills', label: '技能管理', icon: <Icon name="tool" /> },
-  { key: 'remote', label: '远控通道', icon: <Icon name="cloud" /> },
-  { key: 'backup', label: '备份与迁移', icon: <Icon name="database" /> },
-  { key: 'about', label: '关于我们', icon: <Icon name="bulb" /> },
 ];
 
 function SettingsCenter({ currentUser, onLogout }: { currentUser: User; onLogout: () => void }) {

@@ -40,6 +40,7 @@ type FileLookup = {
 
 type CreateFileAssetInput = {
   task: Task;
+  messageId?: string;
   artifactId?: string;
   parentFileId?: string;
   title: string;
@@ -671,6 +672,7 @@ export function createFileAssetService(store: MemoryStore) {
       id: fileId,
       userId: input.task.userId,
       taskId: input.task.id,
+      messageId: input.messageId,
       agentId: agent?.id ?? input.task.agentId,
       artifactId: input.artifactId,
       versionGroupId: fileId,
